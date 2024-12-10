@@ -2,161 +2,153 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.layers import Input
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import joblib
 
 # Load and preprocess data
 def load_and_preprocess_data(file_path):
     data = pd.read_excel(file_path)
-    
-    # Aggregate sales by date
-    aggregated_data = data.groupby('Date of Purchase')['Count'].sum().reset_index()
-    aggregated_data['Date of Purchase'] = pd.to_datetime(aggregated_data['Date of Purchase'])
-    aggregated_data = aggregated_data.sort_values('Date of Purchase')
-    aggregated_data.set_index('Date of Purchase', inplace=True)
-    
-    # Fill missing dates with forward fill then backward fill
-    aggregated_data = aggregated_data.asfreq('D')
-    # Using newer pandas methods instead of deprecated fillna(method=)
-    aggregated_data['Count'] = aggregated_data['Count'].ffill().bfill()
-    
-    # Add time-based features
-    aggregated_data['day_of_week'] = aggregated_data.index.dayofweek
-    aggregated_data['month'] = aggregated_data.index.month
-    aggregated_data['day_of_month'] = aggregated_data.index.day
-    
-    return aggregated_data
+    data['Date of Purchase'] = pd.to_datetime(data['Date of Purchase'])
+    data['YearMonth'] = data['Date of Purchase'].dt.to_period('M')
+    monthly_data = data.groupby('YearMonth')['Count'].sum().reset_index()
+    monthly_data['YearMonth'] = monthly_data['YearMonth'].dt.to_timestamp()
+    monthly_data.set_index('YearMonth', inplace=True)
 
-# Create sequences with multiple features
+    # Add seasonality features
+    monthly_data['sin_month'] = np.sin(2 * np.pi * monthly_data.index.month / 12)
+    monthly_data['cos_month'] = np.cos(2 * np.pi * monthly_data.index.month / 12)
+    return monthly_data
+
+# Create sequences for LSTM
 def create_sequences(data, sequence_length):
     X, y = [], []
     for i in range(len(data) - sequence_length):
         X.append(data[i:i + sequence_length])
-        y.append(data[i + sequence_length, 0])  # Only predict the Count column
+        y.append(data[i + sequence_length, 0])  # Predict only 'Count'
     return np.array(X), np.array(y)
 
-# Build enhanced LSTM model
-def build_model(sequence_length, n_features):
-    model = Sequential()
-    
-    # Add Input layer explicitly
-    model.add(Input(shape=(sequence_length, n_features)))
-    
-    # LSTM layers
-    model.add(LSTM(100, activation='relu', return_sequences=True))
-    model.add(Dropout(0.2))
-    model.add(LSTM(50, activation='relu', return_sequences=True))
-    model.add(Dropout(0.2))
-    model.add(LSTM(50, activation='relu'))
-    model.add(Dropout(0.2))
-    model.add(Dense(25, activation='relu'))
-    model.add(Dense(1))
-    
-    model.compile(optimizer='adam', loss='huber')
+# Build LSTM model
+def build_lstm_model(sequence_length, n_features):
+    model = Sequential([
+        Bidirectional(LSTM(128, activation='tanh', return_sequences=True, input_shape=(sequence_length, n_features))),
+        Dropout(0.2),
+        LSTM(64, activation='tanh'),
+        Dropout(0.2),
+        Dense(1)  # Output layer for predicting 'Count'
+    ])
+    model.compile(optimizer='adam', loss='mse')
     return model
 
-# Main execution
-def train_and_predict(file_path, sequence_length=30, future_steps=600):
-    # Load and preprocess data
+# Train, validate, and save the model
+def train_and_validate(file_path, sequence_length=12, future_steps=6):
+    # Load and preprocess the data
     data = load_and_preprocess_data(file_path)
-    
-    # Scale all features
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(data)
-    
-    # Create sequences with all features
+
+    # Save scaler for future use
+    joblib.dump(scaler, 'scaler.pkl')
+
+    # Create sequences
     X, y = create_sequences(scaled_data, sequence_length)
-    
-    # Split data
+
+    # Split into train and test sets
     train_size = int(len(X) * 0.8)
     X_train, X_test = X[:train_size], X[train_size:]
     y_train, y_test = y[:train_size], y[train_size:]
-    
-    # Build and train model
-    model = build_model(sequence_length, X.shape[2])
-    
-    # Add callbacks for better training
+
+    # Build and train the model
+    model = build_lstm_model(sequence_length, X.shape[2])
+
+    # Callbacks
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-        ModelCheckpoint('best_model.keras', save_best_only=True, monitor='val_loss')  # Changed to .keras extension
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-5),
+        ModelCheckpoint('best_model.keras', save_best_only=True, monitor='val_loss')
     ]
-    
+
     history = model.fit(
         X_train, y_train,
-        epochs=50,
-        batch_size=32,
         validation_data=(X_test, y_test),
+        epochs=50,
+        batch_size=16,
         callbacks=callbacks,
         verbose=1
     )
-    
-    # Plot training history
-    plt.figure(figsize=(10, 6))
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.plot(history.history['val_loss'], label='Validation Loss')
-    plt.title('Model Loss During Training')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.show()
-    
-    # Make predictions
-    predicted = model.predict(X_test)
-    
-    # Prepare for inverse transform
-    pred_copies = np.repeat(predicted, scaled_data.shape[1], axis=1)
-    pred_rescaled = scaler.inverse_transform(pred_copies)[:, 0]
-    
-    y_test_copies = np.repeat(y_test.reshape(-1, 1), scaled_data.shape[1], axis=1)
-    y_test_rescaled = scaler.inverse_transform(y_test_copies)[:, 0]
-    
-    # Plot test predictions
-    plt.figure(figsize=(12, 6))
-    plt.plot(y_test_rescaled, label='Actual', color='blue')
-    plt.plot(pred_rescaled, label='Predicted', color='red')
-    plt.title('Actual vs Predicted Sales')
-    plt.xlabel('Time')
-    plt.ylabel('Sales')
-    plt.legend()
-    plt.show()
-    
-    # Future predictions
-    last_sequence = scaled_data[-sequence_length:]
-    future_predictions = []
-    
-    for _ in range(future_steps):
-        next_pred = model.predict(last_sequence.reshape(1, sequence_length, -1))
-        
-        # Create a full feature set for the next prediction
-        next_date = data.index[-1] + pd.Timedelta(days=len(future_predictions) + 1)
-        next_features = np.zeros((1, scaled_data.shape[1]))
-        next_features[0, 0] = next_pred[0, 0]  # Sales prediction
-        next_features[0, 1] = next_date.dayofweek / 6  # Normalized day of week
-        next_features[0, 2] = next_date.month / 12  # Normalized month
-        next_features[0, 3] = next_date.day / 31  # Normalized day of month
-        
-        future_predictions.append(next_features[0])
-        last_sequence = np.vstack([last_sequence[1:], next_features])
-    
-    # Rescale predictions
-    future_predictions = np.array(future_predictions)
-    future_predictions_rescaled = scaler.inverse_transform(future_predictions)[:, 0]
-    
-    # Plot historical and future predictions
-    plt.figure(figsize=(12, 6))
-    plt.plot(data.index, data['Count'], label='Historical', color='blue')
-    future_dates = pd.date_range(start=data.index[-1] + pd.Timedelta(days=1), periods=future_steps)
-    plt.plot(future_dates, future_predictions_rescaled, label='Forecast', color='green')
-    plt.title('Historical and Forecasted Sales')
-    plt.xlabel('Date')
-    plt.ylabel('Sales')
-    plt.legend()
-    plt.show()
-    
-    return model, history, future_predictions_rescaled
 
-# Example usage
-file_path = r"C:\Users\vimal\OneDrive\Documents\AI Assingments\Capstone\EDA\Cleaned_Data.xlsx"
-model, history, predictions = train_and_predict(file_path)
+    # Save model
+    model.save('final_lstm_model.keras')
+
+    # Evaluate the model
+    y_pred = model.predict(X_test)
+    y_test_rescaled = scaler.inverse_transform(
+        np.hstack([y_test.reshape(-1, 1), np.zeros((len(y_test), scaled_data.shape[1] - 1))])
+    )[:, 0]
+    y_pred_rescaled = scaler.inverse_transform(
+        np.hstack([y_pred, np.zeros((len(y_pred), scaled_data.shape[1] - 1))])
+    )[:, 0]
+
+    mae = mean_absolute_error(y_test_rescaled, y_pred_rescaled)
+    rmse = np.sqrt(mean_squared_error(y_test_rescaled, y_pred_rescaled))
+    r2 = r2_score(y_test_rescaled, y_pred_rescaled)
+
+    print("\nModel Performance Metrics:")
+    print(f"Mean Absolute Error (MAE): {mae:.2f}")
+    print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
+    print(f"R² Score: {r2:.3f}")
+
+    # Future forecasting
+    last_sequence = scaled_data[-sequence_length:, :]
+    future_predictions = []
+
+    for step in range(future_steps):
+        pred = model.predict(last_sequence.reshape(1, sequence_length, -1))
+        future_predictions.append(pred[0, 0])
+        next_step = np.hstack([pred[0, 0], last_sequence[-1, 1:]])
+        last_sequence = np.vstack([last_sequence[1:], next_step])
+
+    # Rescale future predictions
+    future_predictions_rescaled = scaler.inverse_transform(
+        np.hstack([
+            np.array(future_predictions).reshape(-1, 1),
+            np.zeros((len(future_predictions), scaled_data.shape[1] - 1))
+        ])
+    )[:, 0]
+
+    # Get predicted month names
+    last_date = data.index[-1]
+    future_months = pd.date_range(last_date, periods=future_steps + 1, freq='M')[1:]
+    predicted_months = [date.strftime('%B %Y') for date in future_months]
+
+    return model, history, future_predictions_rescaled, y_test_rescaled, y_pred_rescaled, predicted_months
+
+# Visualize results
+def visualize_results(data, y_test_rescaled, y_pred_rescaled, future_predictions_rescaled, predicted_months):
+    # Plot historical and forecasted sales
+    plt.figure(figsize=(12, 6))
+    plt.plot(data.index[-len(y_test_rescaled):], y_test_rescaled, label="Historical Sales", color="blue")
+    plt.plot(data.index[-len(y_test_rescaled):], y_pred_rescaled, label="Predicted Sales", color="orange")
+    future_dates = pd.date_range(data.index[-1], periods=len(future_predictions_rescaled) + 1, freq='M')[1:]
+    plt.plot(future_dates, future_predictions_rescaled, label="Forecasted Sales", color="green")
+    plt.title("Sales Forecast")
+    plt.xlabel("Date")
+    plt.ylabel("Sales")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    # Display future predictions
+    future_df = pd.DataFrame({'Month': predicted_months, 'Predicted Sales': future_predictions_rescaled})
+    print("\nFuture Predictions:")
+    print(future_df)
+
+# Main execution
+if __name__ == "__main__":
+    file_path = r"C:\Users\vimal\OneDrive\Documents\AI Assingments\Capstone\EDA\Cleaned_Data.xlsx"
+    model, history, predictions, y_test_rescaled, y_pred_rescaled, predicted_months = train_and_validate(file_path)
+    print("Predicted Sales for Future Months:", predictions)
+    data = load_and_preprocess_data(file_path)
+    visualize_results(data, y_test_rescaled, y_pred_rescaled, predictions, predicted_months)

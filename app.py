@@ -1,81 +1,97 @@
-import streamlit as st
+import tkinter as tk
+from tkinter import filedialog, messagebox
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import load_model
-import matplotlib.pyplot as plt
+import joblib
 
-# Title and Description
-st.title("Time Series Sales Prediction")
-st.write("This app predicts future sales using an LSTM model trained on historical data.")
+# Load the trained model and scaler
+model = load_model(r"C:\Users\vimal\OneDrive\Documents\AI Assingments\Capstone\time_series_version1\Src\final_lstm_model.keras")
+scaler = joblib.load(r"C:\Users\vimal\OneDrive\Documents\AI Assingments\Capstone\time_series_version1\Src\scaler.pkl")
 
-# Step 1: Upload File
-uploaded_file = st.file_uploader("Upload your dataset (Excel file):", type=["xlsx"])
-
-if uploaded_file:
-    # Step 2: Load and Display Data
-    data = pd.read_excel(uploaded_file)
-    st.write("### Uploaded Data")
-    st.dataframe(data.head())
-
-    # Step 3: Aggregate Sales Data by Month
-    data['Date of Purchase'] = pd.to_datetime(data['Date of Purchase'])
-    monthly_aggregated_data = data.groupby(data['Date of Purchase'].dt.to_period('M'))['Count'].sum().reset_index()
-    monthly_aggregated_data['Date of Purchase'] = monthly_aggregated_data['Date of Purchase'].dt.to_timestamp()
-    monthly_aggregated_data.set_index('Date of Purchase', inplace=True)
-    
-    st.write("### Monthly Aggregated Data")
-    st.line_chart(monthly_aggregated_data['Count'])
-
-    # Step 4: Normalize Data
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_data = scaler.fit_transform(monthly_aggregated_data[['Count']])
-
-    # Step 5: Create Sequences
-    def create_sequences(data, sequence_length=6):
-        X, y = [], []
-        for i in range(len(data) - sequence_length):
-            X.append(data[i:(i + sequence_length)])
-            y.append(data[i + sequence_length])
-        return np.array(X), np.array(y)
-
-    sequence_length = 6
-    X, y = create_sequences(scaled_data)
-
-    # Step 6: Load Trained Model
-    model = load_model("lstm_sales_model.h5")
-    st.success("Model Loaded Successfully!")
-
-    # Step 7: Predict Future Sales
-    future_months = st.slider("Number of Months to Predict", min_value=1, max_value=24, value=6)
-    last_sequence = scaled_data[-sequence_length:]
-    future_predictions = []
-
-    for _ in range(future_months):
-        next_prediction = model.predict(last_sequence.reshape(1, sequence_length, 1))
-        future_predictions.append(next_prediction[0, 0])
-        last_sequence = np.append(last_sequence[1:], next_prediction[0, 0]).reshape(-1, 1)
-
-    # Inverse Transform Predictions
-    future_predictions_original = scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1))
-
-    # Generate Future Dates
-    last_date = monthly_aggregated_data.index[-1]
-    future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=future_months, freq='M')
-
-    # Step 8: Display Predictions
-    st.write("### Future Sales Predictions")
-    future_df = pd.DataFrame({
-        "Date": future_dates,
-        "Predicted Sales": future_predictions_original.flatten()
-    }).set_index("Date")
-    st.line_chart(future_df["Predicted Sales"])
-
-    # Step 9: Download Predictions
-    st.write("### Download Predictions")
-    st.download_button(
-        label="Download Predictions as CSV",
-        data=future_df.to_csv().encode('utf-8'),
-        file_name="future_sales_predictions.csv",
-        mime="text/csv"
+# Function to handle file upload and make predictions
+def upload_and_predict():
+    # Open file dialog to select a file
+    file_path = filedialog.askopenfilename(
+        filetypes=[("CSV Files", "*.csv"), ("Excel Files", "*.xlsx")],
+        title="Select a CSV or Excel File"
     )
+    
+    if not file_path:
+        messagebox.showerror("Error", "No file selected.")
+        return
+
+    try:
+        # Load the uploaded file
+        if file_path.endswith('.csv'):
+            data = pd.read_csv(file_path)
+        elif file_path.endswith('.xlsx'):
+            data = pd.read_excel(file_path)
+        else:
+            messagebox.showerror("Error", "Unsupported file format.")
+            return
+
+        # Ensure the required 'Date of Purchase' and 'Count' columns are present
+        if 'Date of Purchase' not in data.columns or 'Count' not in data.columns:
+            messagebox.showerror("Error", "'Date of Purchase' or 'Count' column is missing in the file.")
+            return
+        
+        # Preprocess the data
+        data['Date of Purchase'] = pd.to_datetime(data['Date of Purchase'])
+        data['YearMonth'] = data['Date of Purchase'].dt.to_period('M')
+        monthly_data = data.groupby('YearMonth')['Count'].sum().reset_index()
+        monthly_data['YearMonth'] = monthly_data['YearMonth'].dt.to_timestamp()
+        monthly_data.set_index('YearMonth', inplace=True)
+        monthly_data['sin_month'] = np.sin(2 * np.pi * monthly_data.index.month / 12)
+        monthly_data['cos_month'] = np.cos(2 * np.pi * monthly_data.index.month / 12)
+
+        # Scale the data
+        scaled_data = scaler.transform(monthly_data)
+
+        # Predict future sales
+        sequence_length = 12
+        last_sequence = scaled_data[-sequence_length:, :]
+        future_steps = 6
+        future_predictions = []
+
+        for _ in range(future_steps):
+            pred = model.predict(last_sequence.reshape(1, sequence_length, -1))
+            future_predictions.append(pred[0, 0])
+            next_step = np.hstack([pred[0, 0], last_sequence[-1, 1:]])
+            last_sequence = np.vstack([last_sequence[1:], next_step])
+
+        # Rescale future predictions
+        future_predictions_rescaled = scaler.inverse_transform(
+            np.hstack([
+                np.array(future_predictions).reshape(-1, 1),
+                np.zeros((len(future_predictions), scaled_data.shape[1] - 1))
+            ])
+        )[:, 0]
+
+        # Display the predictions
+        result_text = "Future Predictions:\n"
+        for i, pred in enumerate(future_predictions_rescaled, start=1):
+            result_text += f"Month {i}: {pred:.2f}\n"
+
+        result_label.config(text=result_text)
+
+    except Exception as e:
+        messagebox.showerror("Error", f"An error occurred:\n{e}")
+
+# Create the GUI
+app = tk.Tk()
+app.title("Sales Forecast Application")
+app.geometry("500x400")
+
+# Create and place widgets
+welcome_label = tk.Label(app, text="Welcome to the Sales Forecast Application", font=("Arial", 14))
+welcome_label.pack(pady=10)
+
+upload_button = tk.Button(app, text="Upload Sales Data File", command=upload_and_predict, font=("Arial", 12))
+upload_button.pack(pady=20)
+
+result_label = tk.Label(app, text="", font=("Arial", 12), justify="left")
+result_label.pack(pady=20)
+
+# Run the app
+app.mainloop()
